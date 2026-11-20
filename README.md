@@ -8,7 +8,12 @@
 - Servlet 容器可直接运行原生 Servlet/Filter/Listener，也可作为 Spring Boot 4 的嵌入式容器替代 Tomcat
 - WebSocket 同时支持原生 `@ServerEndpoint` 端点与 Spring `@EnableWebSocket` 两条升级路径
 
-> 版本：`0.0.2` · JDK 17+ · Kotlin 2.2.0 · Netty 4.2.19.Final · kotlinx-coroutines 1.10.2 · License Apache-2.0
+[![maven](https://img.shields.io/maven-metadata/v.svg?metadataUrl=https://repository.mingliqiye.com/repository/maven-releases/com/mingliqiye/web/netty/netty-server/maven-metadata.xml&label=netty-server)](https://repository.mingliqiye.com/#preview/browse/search/component/maven2%3Acom.mingliqiye.web.netty%3Anetty-server)
+
+[![maven](https://img.shields.io/maven-metadata/v.svg?metadataUrl=https://repository.mingliqiye.com/repository/maven-releases/com/mingliqiye/web/netty/netty-server-servlet6/maven-metadata.xml&label=netty-server-servlet6)](https://repository.mingliqiye.com/#preview/browse/search/component/maven2%3Acom.mingliqiye.web.netty%3Anetty-server-servlet6)
+
+[![maven](https://img.shields.io/maven-metadata/v.svg?metadataUrl=https://repository.mingliqiye.com/repository/maven-releases/com/mingliqiye/web/netty/netty-server-servlet6-spring-boot-starter4/maven-metadata.xml&label=netty-server-servlet6-spring-boot-starter4)](https://repository.mingliqiye.com/#preview/browse/search/component/maven2%3Acom.mingliqiye.web.netty%3Anetty-server-servlet6-spring-boot-starter4)
+>  JDK 17+ · Kotlin 2.2.0 · Netty 4.2.19.Final · kotlinx-coroutines 1.10.2 · License Apache-2.0
 
 ---
 
