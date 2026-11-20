@@ -22,9 +22,12 @@ import com.mingliqiye.web.netty.server.io.NettyIO
  * @property bossThreadName boss 线程名前缀
  * @property workerThreadName worker 线程名前缀
  * @property sportIO 传输层实现，默认按平台自动选择最优（IO_URING/EPOLL/KQUEUE/NIO）
+ * @property sslContext TLS 上下文，非 null 时启用 HTTPS（管线最前端挂 SslHandler）
+ * @property compression 响应压缩配置，非 null 时启用 gzip/deflate 协商压缩
+ * @property http2Enabled 启用 HTTP/2：明文支持 h2c 升级与 prior-knowledge，TLS 支持 ALPN 协商（需 sslContext 含 ALPN 配置）
  */
 data class NettyServerConfig(
-	val serverName: String? = null,
+	var serverName: String? = null,
 	val host: String = "",
 	val port: Int = 8080,
 	val handler: RequestHandler? = null,
@@ -36,4 +39,7 @@ data class NettyServerConfig(
 	val bossThreadName: String = "NettyWebServerBoss",
 	val workerThreadName: String = "NettyWebServerWorker",
 	val sportIO: NettyIO = NettyIO.getSportIO(),
+	val sslContext: io.netty.handler.ssl.SslContext? = null,
+	val compression: CompressionConfig? = null,
+	val http2Enabled: Boolean = false,
 )

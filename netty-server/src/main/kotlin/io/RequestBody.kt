@@ -44,6 +44,14 @@ class RequestBody internal constructor(
 	val isExhausted: Boolean
 		get() = finished && queue.isEmpty() && current?.isReadable != true
 
+	/** body 是否已收完（含 trailer 到达），trailer 字段在此之后才可读。 */
+	val isFinished: Boolean
+		get() = finished
+
+	/** chunked 请求的 trailer 字段（LastHttpContent 携带），未收完时为空表。 */
+	var trailerFields: Map<String, String> = emptyMap()
+		internal set
+
 	internal fun feed(content: HttpContent) {
 		val buf = content.content()
 		if (received.addAndGet(buf.readableBytes().toLong()) > maxBytes) {

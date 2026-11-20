@@ -16,3 +16,8 @@ configurations.testImplementation {
 	exclude(group = "org.springframework.boot", module = "spring-boot-tomcat")
 	exclude(group = "org.springframework.boot", module = "spring-boot-starter-logging")
 }
+
+tasks.named<Test>("test") {
+	// 自签证书无 SAN，JDK HttpClient 主机名校验在类加载时静态读取该属性，须在 JVM 启动参数设置
+	systemProperty("jdk.internal.httpclient.disableHostnameVerification", "true")
+}

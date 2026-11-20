@@ -17,6 +17,7 @@ import jakarta.servlet.ServletException
 import jakarta.servlet.ServletInputStream
 import jakarta.servlet.ServletRequest
 import jakarta.servlet.ServletResponse
+import jakarta.servlet.SessionTrackingMode
 import jakarta.servlet.http.Cookie
 import jakarta.servlet.http.HttpServletMapping
 import jakarta.servlet.http.HttpServletRequest
@@ -45,7 +46,8 @@ import java.util.concurrent.ConcurrentHashMap
  * - 参数惰性解析（query + form-urlencoded），编码取 setCharacterEncoding > 容器默认 > UTF-8；
  * - multipart 限额优先取每 Servlet 的 MultipartConfig，缺省回退容器全局配置；
  * - ERROR/FORWARD/ASYNC 分发期间 [_dispatchUri] 重写 requestURI/queryString；
- * - 会话仅 Cookie 跟踪，Cookie 属性遵循 SessionCookieConfig。
+ * - 会话支持 Cookie 与 URL（;jsessionid 路径参数）双跟踪，Cookie 属性遵循 SessionCookieConfig；
+ * - 路由前剥离全部路径参数（;xxx），getRequestURI 不含 jsessionid。
  */
 internal class HttpServletRequestImpl(
 	val nettyRequest: HttpRequest,
@@ -56,10 +58,26 @@ internal class HttpServletRequestImpl(
 ) : HttpServletRequest {
 	companion object {
 		private val log = com.mingliqiye.logger.Loggers.getLogger<HttpServletRequestImpl>()
+		private val JSESSIONID_PATTERN = Regex(";jsessionid=([^;/?#]+)", RegexOption.IGNORE_CASE)
+
+		private fun stripPathParameters(path: String): String {
+			if (';' !in path) return path
+			return path.split('/').joinToString("/") { it.substringBefore(';') }
+		}
 	}
 
 	private val attributes = ConcurrentHashMap<String, Any>()
 	private val decoder = QueryStringDecoder(nettyRequest.uri())
+
+	/** 剥离路径参数后的路由路径（;jsessionid 等不参与 Servlet 匹配）。 */
+	private val cleanPath: String = stripPathParameters(decoder.path())
+
+	/** URL 路径参数中携带的会话 ID（;jsessionid=...）。 */
+	private val urlSessionId: String? = JSESSIONID_PATTERN.find(decoder.path())?.groupValues?.get(1)
+
+	private val cookieSessionId: String? by lazy {
+		cookies?.firstOrNull { it.name == servletContext.sessionCookieConfig.name }?.value
+	}
 
 	private var charset: Charset? = null
 	private var parameters: MutableMap<String, MutableList<String>>? = null
@@ -82,11 +100,14 @@ internal class HttpServletRequestImpl(
 	/** 请求已升级为 WebSocket：容器不再写出 HTTP 响应，连接由 WS 会话接管。 */
 	internal var _upgraded = false
 
+	/** run-as 身份：目标 Servlet 声明 runAsRole 时，执行期间覆盖认证主体。 */
+	internal var _runAs: com.mingliqiye.web.netty.servlet.security.RealmPrincipal? = null
+
 	private val _requestId: String = UUID.randomUUID().toString()
 
 	override fun getMethod(): String = nettyRequest.method().name()
 
-	override fun getRequestURI(): String = _dispatchUri?.substringBefore('?') ?: decoder.path()
+	override fun getRequestURI(): String = _dispatchUri?.substringBefore('?') ?: cleanPath
 
 	override fun getRequestURL(): StringBuffer {
 		val host = getHeader("Host") ?: "${getLocalName()}:${getLocalPort()}"
@@ -106,7 +127,7 @@ internal class HttpServletRequestImpl(
 
 	override fun getProtocol(): String = nettyRequest.protocolVersion().text()
 
-	override fun getScheme(): String = "http"
+	override fun getScheme(): String = if (isSecure) "https" else "http"
 
 	override fun getServerName(): String = getHeader("Host")?.substringBefore(':') ?: getLocalName()
 
@@ -130,7 +151,21 @@ internal class HttpServletRequestImpl(
 	override fun getLocalPort(): Int =
 		(ctx.channel().localAddress() as? InetSocketAddress)?.port ?: 0
 
-	override fun isSecure(): Boolean = false
+	/** 连接是否经 TLS（本通道或父通道管线中存在 SslHandler；HTTP/2 流子通道的 SslHandler 在父通道）。 */
+	private val secure: Boolean = run {
+		var channel: io.netty.channel.Channel? = ctx.channel()
+		var found = false
+		while (channel != null) {
+			if (channel.pipeline().get(io.netty.handler.ssl.SslHandler::class.java) != null) {
+				found = true
+				break
+			}
+			channel = channel.parent()
+		}
+		found
+	}
+
+	override fun isSecure(): Boolean = secure
 
 	override fun getHeader(name: String): String? = nettyRequest.headers().get(name)
 
@@ -276,8 +311,12 @@ internal class HttpServletRequestImpl(
 		return Collections.enumeration(locales)
 	}
 
-	override fun getRequestedSessionId(): String? =
-		cookies?.firstOrNull { it.name == servletContext.sessionCookieConfig.name }?.value
+	override fun getRequestedSessionId(): String? {
+		val modes = servletContext.effectiveSessionTrackingModes
+		if (SessionTrackingMode.COOKIE in modes && cookieSessionId != null) return cookieSessionId
+		if (SessionTrackingMode.URL in modes) return urlSessionId
+		return null
+	}
 
 	override fun getSession(create: Boolean): HttpSession? {
 		session?.let {
@@ -285,8 +324,13 @@ internal class HttpServletRequestImpl(
 		}
 		val manager = container.sessions
 		var found = manager.find(requestedSessionId)
+		val cookieEnabled = SessionTrackingMode.COOKIE in servletContext.effectiveSessionTrackingModes
 		if (found == null && create) {
 			found = manager.create()
+			if (cookieEnabled) {
+				servletResponse.addCookie(sessionCookie(found.id))
+			}
+		} else if (found != null && cookieEnabled && isRequestedSessionIdFromURL) {
 			servletResponse.addCookie(sessionCookie(found.id))
 		}
 		session = found
@@ -300,7 +344,9 @@ internal class HttpServletRequestImpl(
 			?: throw IllegalStateException("No session associated with request")
 		val renewed = container.sessions.changeId(current)
 		session = renewed
-		servletResponse.addCookie(sessionCookie(renewed.id))
+		if (SessionTrackingMode.COOKIE in servletContext.effectiveSessionTrackingModes) {
+			servletResponse.addCookie(sessionCookie(renewed.id))
+		}
 		return renewed.id
 	}
 
@@ -318,25 +364,49 @@ internal class HttpServletRequestImpl(
 	override fun isRequestedSessionIdValid(): Boolean =
 		container.sessions.find(requestedSessionId) != null
 
-	override fun isRequestedSessionIdFromCookie(): Boolean = requestedSessionId != null
+	override fun isRequestedSessionIdFromCookie(): Boolean =
+		SessionTrackingMode.COOKIE in servletContext.effectiveSessionTrackingModes && cookieSessionId != null
 
-	override fun isRequestedSessionIdFromURL(): Boolean = false
+	override fun isRequestedSessionIdFromURL(): Boolean =
+		!isRequestedSessionIdFromCookie &&
+			SessionTrackingMode.URL in servletContext.effectiveSessionTrackingModes &&
+			urlSessionId != null
 
-	override fun getAuthType(): String? = null
+	override fun getAuthType(): String? {
+		val session = getSession(false) ?: return null
+		return session.getAttribute(com.mingliqiye.web.netty.servlet.core.ServletContainer.AUTH_TYPE_KEY) as? String
+	}
 
-	override fun getRemoteUser(): String? = null
+	override fun getRemoteUser(): String? = effectivePrincipal()?.name
 
-	override fun isUserInRole(role: String): Boolean = false
+	private fun effectivePrincipal(): com.mingliqiye.web.netty.servlet.security.RealmPrincipal? =
+		_runAs ?: container.principalOf(this)
 
-	override fun getUserPrincipal(): Principal? = null
+	override fun isUserInRole(role: String): Boolean = effectivePrincipal()?.roles?.contains(role) ?: false
 
-	override fun authenticate(response: HttpServletResponse): Boolean =
-		throw UnsupportedOperationException("Authentication not supported")
+	override fun getUserPrincipal(): Principal? = effectivePrincipal()
 
-	override fun login(username: String, password: String) =
-		throw UnsupportedOperationException("Login not supported")
+	override fun authenticate(response: HttpServletResponse): Boolean {
+		if (effectivePrincipal() != null) return true
+		return container.challenge(this, response as HttpServletResponseImpl)
+	}
 
-	override fun logout() = throw UnsupportedOperationException("Logout not supported")
+	override fun login(username: String, password: String) {
+		val realm = container.config.realm
+			?: throw ServletException("No realm configured")
+		val principal = realm.authenticate(username, password)
+			?: throw ServletException("Login failed for user '$username'")
+		val authType = container.config.loginConfig?.authMethod?.name
+			?: com.mingliqiye.web.netty.servlet.security.AuthMethod.BASIC.name
+		container.establishLogin(this, principal, authType)
+	}
+
+	override fun logout() {
+		val session = getSession(false) ?: return
+		session.removeAttribute(com.mingliqiye.web.netty.servlet.core.ServletContainer.PRINCIPAL_KEY)
+		session.removeAttribute(com.mingliqiye.web.netty.servlet.core.ServletContainer.AUTH_TYPE_KEY)
+		session.invalidate()
+	}
 
 	override fun <T : jakarta.servlet.http.HttpUpgradeHandler> upgrade(handlerClass: Class<T>): T =
 		throw UnsupportedOperationException("Upgrade not supported")
@@ -408,10 +478,11 @@ internal class HttpServletRequestImpl(
 		override fun getConnectionId(): String = _requestId
 		override fun getProtocolConnectionId(): String = ""
 		override fun getProtocol(): String = this@HttpServletRequestImpl.protocol
-		override fun isSecure(): Boolean = false
+		override fun isSecure(): Boolean = secure
 	}
 
-	override fun getTrailerFields(): Map<String, String> = emptyMap()
+	override fun getTrailerFields(): Map<String, String> =
+		if (body.isFinished) body.trailerFields else emptyMap()
 
-	override fun isTrailerFieldsReady(): Boolean = true
+	override fun isTrailerFieldsReady(): Boolean = body.isFinished
 }

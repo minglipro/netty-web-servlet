@@ -16,15 +16,6 @@ internal object UrlPatternMatcher {
 		else -> pattern == path
 	}
 
-	/** 按规范优先级从候选模式中选出唯一匹配，无匹配返回 null。 */
-	fun match(patterns: Collection<String>, path: String): String? {
-		patterns.firstOrNull { it == path }?.let { return it }
-		patterns.filter { it.endsWith("/*") && matches(it, path) }
-			.maxByOrNull { it.length }?.let { return it }
-		patterns.firstOrNull { it.startsWith("*.") && matches(it, path) }?.let { return it }
-		return patterns.firstOrNull { it == "/" }
-	}
-
 	/** 按匹配模式拆分 servletPath 与 pathInfo。 */
 	fun servletPath(pattern: String?, path: String): Pair<String, String?> = when {
 		pattern == null -> Pair("", path)

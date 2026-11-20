@@ -6,6 +6,7 @@ import com.mingliqiye.web.netty.server.config.NettyServerConfig
 import com.mingliqiye.web.netty.server.data.StreamingTask
 import com.mingliqiye.web.netty.server.handler.StreamingWebHandler
 import com.mingliqiye.web.netty.server.handler.WebHandler
+import com.mingliqiye.web.netty.server.io.HeaderUtils
 import com.mingliqiye.web.netty.server.io.RequestBody
 import com.mingliqiye.web.netty.server.io.Responses
 import com.mingliqiye.web.netty.server.poll.CoroutineWorkerPool
@@ -39,6 +40,7 @@ typealias StreamingRequestHandler = suspend (HttpRequest, RequestBody, ChannelHa
 open class NettyWebServer internal constructor(
 	val config: NettyServerConfig,
 ) {
+
 	companion object {
 		private val log = Loggers.getLogger(NettyWebServer::class.java)
 
@@ -100,8 +102,12 @@ open class NettyWebServer internal constructor(
 		}
 	}
 
+	init {
+		HeaderUtils.config = config
+	}
+
 	/** 日志与线程命名用的服务器名，未配置时按类名+哈希生成。 */
-	val serverName = config.serverName?:"${this.javaClass.simpleName}@${this.hashCode().toString(16)}"
+	val serverName = HeaderUtils.getServerName()
 
 	/** 配置的绑定地址，空串表示所有网卡。 */
 	val host: String get() = config.host
@@ -151,17 +157,114 @@ open class NettyWebServer internal constructor(
 		.group(bossGroup, workerGroup)
 		.childHandler(object : ChannelInitializer<Channel>() {
 			override fun initChannel(ch: Channel) {
-				ch.pipeline().apply {
-					addLast(HttpServerCodec())
-					if (streamPool != null) {
-						addLast(StreamingWebHandler(streamPool, config.maxRequestSize))
-					} else {
-						addLast(HttpObjectAggregator(config.maxRequestSize))
-						addLast(WebHandler(fullPool!!))
+				val pipeline = ch.pipeline()
+				when {
+					config.http2Enabled && config.sslContext != null -> configureHttp2Tls(pipeline, ch)
+					config.http2Enabled -> configureHttp2Cleartext(pipeline)
+					else -> {
+						config.sslContext?.let { pipeline.addLast(it.newHandler(ch.alloc())) }
+						pipeline.addLast(HttpServerCodec())
+						addHttp1BusinessHandlers(pipeline)
 					}
 				}
 			}
 		})
+
+	/** HTTP/1.1 业务段：压缩器 + 流式/聚合处理器。HTTP/2 时挂到每条流的子通道上复用。 */
+	private fun addHttp1BusinessHandlers(pipeline: io.netty.channel.ChannelPipeline) {
+		config.compression?.let { pipeline.addLast(com.mingliqiye.web.netty.server.handler.ConfigurableCompressor(it)) }
+		if (streamPool != null) {
+			pipeline.addLast(StreamingWebHandler(streamPool, config.maxRequestSize))
+		} else {
+			pipeline.addLast(HttpObjectAggregator(config.maxRequestSize))
+			pipeline.addLast(WebHandler(fullPool!!))
+		}
+	}
+
+	/** HTTP/2 流子通道初始化器：帧↔HTTP 对象转换后复用 HTTP/1.1 业务段（ChannelInitializer 可共享）。 */
+	private val http2StreamInitializer = object : ChannelInitializer<io.netty.handler.codec.http2.Http2StreamChannel>() {
+		override fun initChannel(ch: io.netty.handler.codec.http2.Http2StreamChannel) {
+			ch.pipeline().addLast(io.netty.handler.codec.http2.Http2StreamFrameToHttpObjectCodec(true))
+			addHttp1BusinessHandlers(ch.pipeline())
+		}
+	}
+
+	private fun newHttp2ConnectionHandlers(): Array<io.netty.channel.ChannelHandler> = arrayOf(
+		io.netty.handler.codec.http2.Http2FrameCodecBuilder.forServer().build(),
+		io.netty.handler.codec.http2.Http2MultiplexHandler(http2StreamInitializer),
+	)
+
+	/**
+	 * 明文 HTTP/2：[io.netty.handler.codec.http2.CleartextHttp2ServerUpgradeHandler] 同时处理
+	 * prior-knowledge（直接收到 HTTP/2 preface）与 h2c 升级（HTTP/1.1 Upgrade: h2c）；
+	 * HTTP/1.1 业务段预先挂好，两者都未命中时按普通 HTTP/1.1 管线工作，
+	 * 命中任一 HTTP/2 路径时先移除业务段再装配 HTTP/2 处理器。
+	 */
+	private fun configureHttp2Cleartext(pipeline: io.netty.channel.ChannelPipeline) {
+		val sourceCodec = HttpServerCodec()
+		val upgradeHandler = HttpServerUpgradeHandler(sourceCodec, h2cUpgradeCodecFactory(), config.maxRequestSize)
+		val priorKnowledge = object : ChannelInitializer<Channel>() {
+			override fun initChannel(ch: Channel) {
+				removeHttp1BusinessHandlers(ch.pipeline())
+				newHttp2ConnectionHandlers().forEach { ch.pipeline().addLast(it) }
+			}
+		}
+		pipeline.addLast(io.netty.handler.codec.http2.CleartextHttp2ServerUpgradeHandler(sourceCodec, upgradeHandler, priorKnowledge))
+		addHttp1BusinessHandlers(pipeline)
+	}
+
+	/** h2c 升级编解码器工厂：仅响应 "h2c" 协议，升级后移除 HTTP/1.1 业务段。 */
+	private fun h2cUpgradeCodecFactory() = HttpServerUpgradeHandler.UpgradeCodecFactory { protocol ->
+		if (protocol.toString().equals("h2c", ignoreCase = true)) {
+			io.netty.handler.codec.http2.Http2ServerUpgradeCodec(
+				io.netty.handler.codec.http2.Http2FrameCodecBuilder.forServer().build(),
+				io.netty.handler.codec.http2.Http2MultiplexHandler(http2StreamInitializer),
+				Http1BusinessRemover(),
+			)
+		} else {
+			null
+		}
+	}
+
+	/** 移除 HTTP/1.1 业务段（压缩器 + 流式/聚合处理器），供切换到 HTTP/2 管线时调用。 */
+	private fun removeHttp1BusinessHandlers(p: io.netty.channel.ChannelPipeline) {
+		if (p.get(com.mingliqiye.web.netty.server.handler.ConfigurableCompressor::class.java) != null) {
+			p.remove(com.mingliqiye.web.netty.server.handler.ConfigurableCompressor::class.java)
+		}
+		if (streamPool != null) {
+			if (p.get(StreamingWebHandler::class.java) != null) p.remove(StreamingWebHandler::class.java)
+		} else {
+			if (p.get(HttpObjectAggregator::class.java) != null) p.remove(HttpObjectAggregator::class.java)
+			if (p.get(WebHandler::class.java) != null) p.remove(WebHandler::class.java)
+		}
+	}
+
+	/**
+	 * TLS HTTP/2：SslHandler 经 ALPN 协商 h2/http1.1，
+	 * [io.netty.handler.ssl.ApplicationProtocolNegotiationHandler] 按结果装配对应管线。
+	 * 要求 [NettyServerConfig.sslContext] 构建时携带 ALPN 配置（见 starter / Http2 alpn 辅助）。
+	 */
+	private fun configureHttp2Tls(pipeline: io.netty.channel.ChannelPipeline, ch: Channel) {
+		pipeline.addLast(config.sslContext!!.newHandler(ch.alloc()))
+		pipeline.addLast(object : io.netty.handler.ssl.ApplicationProtocolNegotiationHandler(io.netty.handler.ssl.ApplicationProtocolNames.HTTP_1_1) {
+			override fun configurePipeline(ctx: ChannelHandlerContext, protocol: String) {
+				if (protocol == io.netty.handler.ssl.ApplicationProtocolNames.HTTP_2) {
+					newHttp2ConnectionHandlers().forEach { ctx.pipeline().addLast(it) }
+				} else {
+					ctx.pipeline().addLast(HttpServerCodec())
+					addHttp1BusinessHandlers(ctx.pipeline())
+				}
+			}
+		})
+	}
+
+	/** h2c 升级成功后移除仍留在管线尾部的 HTTP/1.1 业务段。 */
+	private inner class Http1BusinessRemover : io.netty.channel.ChannelInboundHandlerAdapter() {
+		override fun handlerAdded(ctx: ChannelHandlerContext) {
+			removeHttp1BusinessHandlers(ctx.pipeline())
+			ctx.pipeline().remove(this)
+		}
+	}
 
 
 	/**

@@ -1,9 +1,7 @@
 package com.mingliqiye.web.netty.servlet.websocket
 
-import com.mingliqiye.web.netty.servlet.http.HttpServletRequestImpl
 import io.netty.buffer.Unpooled
-import io.netty.channel.ChannelHandlerContext
-import io.netty.handler.codec.http.QueryStringDecoder
+import io.netty.channel.Channel
 import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame
 import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame
 import io.netty.handler.codec.http.websocketx.ContinuationWebSocketFrame
@@ -53,21 +51,21 @@ internal class HandlerEntry(
  */
 internal class WebSocketSessionImpl(
 	private val wsContainer: NettyWebSocketContainer,
-	private val servletRequest: HttpServletRequestImpl,
+	transport: WebSocketTransport,
 	val config: EndpointConfig,
 	val endpoint: jakarta.websocket.Endpoint,
 	private val pathParameters: Map<String, String>,
 	private val subprotocol: String,
+	private val negotiatedExtensions: List<io.netty.handler.codec.http.websocketx.extensions.WebSocketServerExtension> = emptyList(),
 ) : Session {
 	companion object {
 		private val log = com.mingliqiye.logger.Loggers.getLogger<WebSocketSessionImpl>()
 	}
 
 	private val id = java.util.UUID.randomUUID().toString()
-	private val ctx: ChannelHandlerContext = servletRequest.ctx
 
 	/** 升级后原 HTTP 业务处理器已移出管线，出站必须经 channel（从管线尾端走编码器）。 */
-	private val channel = ctx.channel()
+	private val channel: Channel = transport.channel
 	private val userProperties = ConcurrentHashMap<String, Any>().also { it.putAll(config.userProperties) }
 	private val handlers = mutableListOf<HandlerEntry>()
 	private val open = AtomicBoolean(true)
@@ -92,11 +90,11 @@ internal class WebSocketSessionImpl(
 	@Volatile
 	private var maxTextBufferSize = wsContainer.defaultMaxTextMessageBufferSize
 
-	private val requestUri: URI = run {
-		val host = servletRequest.getHeader("Host") ?: "localhost"
-		URI.create("ws://$host${servletRequest.nettyRequest.uri()}")
-	}
-	private val parameterMap: Map<String, List<String>> = QueryStringDecoder(servletRequest.nettyRequest.uri()).parameters()
+	private val requestUri: URI = transport.requestUri
+	private val parameterMap: Map<String, List<String>> = transport.parameterMap
+	private val queryString: String? = transport.queryString
+	private val userPrincipal: Principal? = transport.userPrincipal
+	private val secure: Boolean = transport.secure
 
 	private val basicRemote = BasicRemote()
 	private val asyncRemote = AsyncRemote()
@@ -105,19 +103,25 @@ internal class WebSocketSessionImpl(
 
 	override fun getId(): String = id
 
-	override fun isOpen(): Boolean = open.get() && ctx.channel().isActive
+	override fun isOpen(): Boolean = open.get() && channel.isActive
 
-	override fun isSecure(): Boolean = false
+	override fun isSecure(): Boolean = secure
 
 	override fun getProtocolVersion(): String = "13"
 
 	override fun getNegotiatedSubprotocol(): String = subprotocol
 
-	override fun getNegotiatedExtensions(): List<Extension> = emptyList()
+	override fun getNegotiatedExtensions(): List<Extension> = negotiatedExtensions.map { ext ->
+		val data = ext.newReponseData()
+		WebSocketExtensionImpl(
+			data.name(),
+			data.parameters().map { (name, value) -> WebSocketParameterImpl(name, value ?: "") },
+		)
+	}
 
 	override fun getRequestURI(): URI = requestUri
 
-	override fun getQueryString(): String? = servletRequest.queryString
+	override fun getQueryString(): String? = queryString
 
 	override fun getRequestParameterMap(): Map<String, List<String>> = parameterMap
 
@@ -125,7 +129,7 @@ internal class WebSocketSessionImpl(
 
 	override fun getUserProperties(): MutableMap<String, Any> = userProperties
 
-	override fun getUserPrincipal(): Principal? = servletRequest.userPrincipal
+	override fun getUserPrincipal(): Principal? = userPrincipal
 
 	override fun getOpenSessions(): Set<Session> =
 		wsContainer.openSessions.filter { it.isOpen && it.requestURI.path == requestUri.path }.toSet()
@@ -288,7 +292,7 @@ internal class WebSocketSessionImpl(
 		log.debug { "WebSocket session $id closing: ${reason.closeCode.code} ${reason.reasonPhrase}" }
 		val frame = CloseWebSocketFrame(reason.closeCode.code, reason.reasonPhrase ?: "")
 		channel.writeAndFlush(frame)
-		ctx.executor().schedule({
+		channel.eventLoop().schedule({
 			if (open.get()) channel.close()
 		}, 5, TimeUnit.SECONDS)
 	}
@@ -324,7 +328,7 @@ internal class WebSocketSessionImpl(
 		checkOpen()
 		lastActivity = System.currentTimeMillis()
 		val future = channel.writeAndFlush(frame)
-		if (blocking && !ctx.executor().inEventLoop()) {
+		if (blocking && !channel.eventLoop().inEventLoop()) {
 			future.await(asyncRemote.sendTimeout.coerceAtLeast(1), TimeUnit.MILLISECONDS)
 			if (!future.isSuccess) throw IOException("WebSocket send failed", future.cause())
 		}
@@ -488,7 +492,7 @@ internal class WebSocketSessionImpl(
 			checkOpen()
 			lastActivity = System.currentTimeMillis()
 			channel.writeAndFlush(frame).addListener { f ->
-				val sendResult = SendResult(f.cause())
+				val sendResult = SendResult(this@WebSocketSessionImpl, f.cause())
 				if (f.isSuccess) result.complete(null) else result.completeExceptionally(f.cause() ?: IOException("Send failed"))
 				handler?.onResult(sendResult)
 			}
@@ -521,7 +525,7 @@ internal class WebSocketSessionImpl(
 				val textEncoder = config.encoders.any { canEncode(it, obj) && Encoder.Text::class.java.isAssignableFrom(it) }
 				if (textEncoder) sendText(encodeText(obj), handler) else sendBinary(encodeBinary(obj), handler)
 			} catch (e: Exception) {
-				handler.onResult(SendResult(e))
+				handler.onResult(SendResult(this@WebSocketSessionImpl, e))
 			}
 		}
 	}

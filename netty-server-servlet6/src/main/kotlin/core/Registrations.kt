@@ -59,6 +59,14 @@ internal class ServletRegistrationImpl(
 	var multipartConfig: jakarta.servlet.MultipartConfigElement? = null
 		private set
 
+	/** 声明式安全约束（setServletSecurity），null 表示无约束。 */
+	var servletSecurity: ServletSecurityElement? = null
+		private set
+
+	/** run-as 角色：执行期间以该角色身份运行（getUserPrincipal/isUserInRole 随之变化）。 */
+	var runAsRoleValue: String? = null
+		private set
+
 	fun config(): ServletConfig = ServletConfigImpl(name, context, params)
 
 	override fun getName(): String = name
@@ -91,19 +99,24 @@ internal class ServletRegistrationImpl(
 
 	override fun getMappings(): Collection<String> = mappings
 
-	override fun getRunAsRole(): String? = null
+	override fun getRunAsRole(): String? = runAsRoleValue
 
 	override fun setLoadOnStartup(loadOnStartup: Int) {
 		this.loadOnStartupValue = loadOnStartup
 	}
 
-	override fun setServletSecurity(constraint: ServletSecurityElement): Set<String> = emptySet()
+	override fun setServletSecurity(constraint: ServletSecurityElement): Set<String> {
+		servletSecurity = constraint
+		return emptySet()
+	}
 
 	override fun setMultipartConfig(multipartConfig: jakarta.servlet.MultipartConfigElement?) {
 		this.multipartConfig = multipartConfig
 	}
 
-	override fun setRunAsRole(roleName: String?) {}
+	override fun setRunAsRole(roleName: String?) {
+		runAsRoleValue = roleName
+	}
 
 	override fun setAsyncSupported(isAsyncSupported: Boolean) {
 		asyncSupported = isAsyncSupported

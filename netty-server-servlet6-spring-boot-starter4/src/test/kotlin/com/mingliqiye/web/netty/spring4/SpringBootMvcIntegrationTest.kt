@@ -28,6 +28,9 @@ class TestController {
 	@GetMapping("/hello")
 	fun hello(): String = "hello-mvc"
 
+	@GetMapping("/big")
+	fun big(): String = "x".repeat(5000)
+
 	@GetMapping("/fail")
 	fun fail(): String = throw RuntimeException("kaboom")
 

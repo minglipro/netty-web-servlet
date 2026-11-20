@@ -46,6 +46,9 @@ class NettyServletServer(config: ServletServerConfig = ServletServerConfig()) {
 				bossThreadName = config.bossThreadName,
 				workerThreadName = config.workerThreadName,
 				sportIO = config.sportIO,
+				sslContext = config.sslContext,
+				compression = config.compression,
+				http2Enabled = config.http2Enabled,
 				streamingHandler = container::handle,
 			)
 		)

@@ -1,0 +1,14 @@
+{
+  "serverName" : null,
+  "host" : "",
+  "port" : 8080,
+  "queueCapacity" : 4096,
+  "maxRequestSize" : 1048576,
+  "bossThreads" : 1,
+  "workerThreads" : 0,
+  "bossThreadName" : "NettyWebServerBoss",
+  "workerThreadName" : "NettyWebServerWorker",
+  "sportIO" : "NIO",
+  "http2Enabled" : true,
+  "rootDir" : ""
+}

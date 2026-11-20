@@ -1,6 +1,7 @@
 package com.mingliqiye.web.netty.servlet.http
 
 import com.mingliqiye.web.netty.server.io.ResponseStream
+import com.mingliqiye.web.netty.servlet.session.HttpSessionImpl
 import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
 import io.netty.handler.codec.http.DefaultFullHttpResponse
@@ -13,6 +14,7 @@ import io.netty.handler.codec.http.HttpVersion
 import io.netty.handler.codec.http.cookie.DefaultCookie
 import io.netty.handler.codec.http.cookie.ServerCookieEncoder
 import jakarta.servlet.ServletOutputStream
+import jakarta.servlet.SessionTrackingMode
 import jakarta.servlet.http.Cookie
 import jakarta.servlet.http.HttpServletResponse
 import java.io.ByteArrayOutputStream
@@ -34,6 +36,7 @@ import java.util.TreeMap
 internal class HttpServletResponseImpl(private val initialBufferSize: Int = 8192) : HttpServletResponse {
 	companion object {
 		private val log = com.mingliqiye.logger.Loggers.getLogger<HttpServletResponseImpl>()
+		private val JSESSIONID_PATTERN = Regex(";jsessionid=[^;/?#]*", RegexOption.IGNORE_CASE)
 	}
 
 	private val headers = TreeMap<String, MutableList<String>>(String.CASE_INSENSITIVE_ORDER)
@@ -73,6 +76,9 @@ internal class HttpServletResponseImpl(private val initialBufferSize: Int = 8192
 	/** 容器级默认响应编码（ServletContext.setResponseCharacterEncoding）。 */
 	internal var defaultEncoding: String? = null
 
+	/** 关联的 Servlet 请求（encodeURL 会话重写依据），容器分发时注入。 */
+	internal var servletRequest: HttpServletRequestImpl? = null
+
 	/** 当前缓冲内容快照。 */
 	val body: ByteArray get() = buffer.toByteArray()
 
@@ -108,9 +114,28 @@ internal class HttpServletResponseImpl(private val initialBufferSize: Int = 8192
 
 	override fun containsHeader(name: String): Boolean = headers.containsKey(name)
 
-	override fun encodeURL(url: String): String = url
+	override fun encodeURL(url: String): String = encodeSessionUrl(url)
 
-	override fun encodeRedirectURL(url: String): String = url
+	override fun encodeRedirectURL(url: String): String = encodeSessionUrl(url)
+
+	/**
+	 * URL 会话重写：启用 URL 跟踪、存在会话且客户端尚未用 Cookie 携带会话 ID 时，
+	 * 在路径段追加 ;jsessionid=<id>（保留 query/fragment，替换已有的 jsessionid 参数）。
+	 */
+	private fun encodeSessionUrl(url: String): String {
+		val req = servletRequest ?: return url
+		if (SessionTrackingMode.URL !in req.servletContext.effectiveSessionTrackingModes) return url
+		val session = req.getSession(false) as? HttpSessionImpl ?: return url
+		if (req.isRequestedSessionIdFromCookie) return url
+		val suffixStart = listOf(url.indexOf('?'), url.indexOf('#')).filter { it >= 0 }.minOrNull() ?: url.length
+		var path = url.substring(0, suffixStart).replace(JSESSIONID_PATTERN, "")
+		val suffix = url.substring(suffixStart)
+		val authority = path.indexOf("://")
+		if (authority >= 0 && path.indexOf('/', authority + 3) < 0) {
+			path += "/"
+		}
+		return "$path;jsessionid=${session.id}$suffix"
+	}
 
 	override fun sendError(sc: Int) = sendError(sc, null)
 
@@ -124,12 +149,14 @@ internal class HttpServletResponseImpl(private val initialBufferSize: Int = 8192
 		committed = true
 	}
 
-	/** ERROR 分发前重置：清缓冲与头部，保留 Set-Cookie（会话 Cookie 不丢），解除提交状态。 */
+	/** ERROR 分发前重置：清缓冲与头部，保留 Set-Cookie 与 WWW-Authenticate，解除提交状态。 */
 	internal fun resetForError() {
 		buffer.reset()
 		val cookies = headers["Set-Cookie"]
+		val challenge = headers["WWW-Authenticate"]
 		headers.clear()
 		cookies?.let { headers["Set-Cookie"] = it }
+		challenge?.let { headers["WWW-Authenticate"] = it }
 		contentType = null
 		committed = false
 	}
@@ -243,7 +270,7 @@ internal class HttpServletResponseImpl(private val initialBufferSize: Int = 8192
 				val ctx = checkNotNull(attachCtx) { "Response not attached to a channel" }
 				val request = checkNotNull(attachRequest) { "Response not attached to a request" }
 				log.debug { "Response committed, switching to chunked streaming (status=$status)" }
-				val head = DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.valueOf(status))
+				val head = DefaultHttpResponse(request.protocolVersion(), HttpResponseStatus.valueOf(status))
 				for ((name, values) in headers) {
 					if (name.equals("Content-Length", true)) continue
 					head.headers().set(name, values)
@@ -309,11 +336,12 @@ internal class HttpServletResponseImpl(private val initialBufferSize: Int = 8192
 			Unpooled.wrappedBuffer(bytes),
 		)
 		for ((name, values) in headers) {
-			if (name.equals("Content-Length", true)) continue
 			response.headers().set(name, values)
 		}
 		contentType?.let { response.headers().set("Content-Type", it) }
-		response.headers().set("Content-Length", bytes.size)
+		if (!response.headers().contains("Content-Length")) {
+			response.headers().set("Content-Length", bytes.size)
+		}
 		return response
 	}
 }

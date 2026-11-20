@@ -1,5 +1,6 @@
 package com.mingliqiye.web.netty.server.io
 
+import com.mingliqiye.web.netty.server.io.HeaderUtils.addSystemHeaders
 import io.netty.channel.ChannelFutureListener
 import io.netty.channel.ChannelHandlerContext
 import io.netty.handler.codec.http.FullHttpResponse
@@ -19,6 +20,7 @@ object Responses {
 	fun write(ctx: ChannelHandlerContext, request: HttpRequest, response: FullHttpResponse) {
 		val keepAlive = HttpUtil.isKeepAlive(request) && ctx.channel().attr(MUST_CLOSE).get() != true
 		HttpUtil.setKeepAlive(response, keepAlive)
+		response.addSystemHeaders()
 		ctx.executor().execute {
 			if (ctx.channel().isActive) {
 				val future = ctx.writeAndFlush(response)

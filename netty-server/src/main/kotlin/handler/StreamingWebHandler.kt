@@ -48,17 +48,25 @@ class StreamingWebHandler(
 					response.headers().set(HttpHeaderNames.CONTENT_LENGTH, 0)
 					response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE)
 					ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE)
+				} else if (msg is LastHttpContent) {
+					// HTTP/2 endStream 头帧经转换后是 FullHttpRequest：头与 body 结束信号同一条消息
+					acceptContent(msg)
 				}
 			}
 
-			is HttpContent -> {
-				val current = body ?: return
-				current.feed(msg)
-				if (msg is LastHttpContent) {
-					current.finish()
-					body = null
-				}
+			is HttpContent -> acceptContent(msg)
+		}
+	}
+
+	private fun acceptContent(msg: HttpContent) {
+		val current = body ?: return
+		current.feed(msg)
+		if (msg is LastHttpContent) {
+			if (!msg.trailingHeaders().isEmpty) {
+				current.trailerFields = msg.trailingHeaders().entries().associate { it.key.toString() to it.value.toString() }
 			}
+			current.finish()
+			body = null
 		}
 	}
 

@@ -21,6 +21,15 @@ import com.mingliqiye.web.netty.server.io.NettyIO
  * @property bossThreadName boss 线程名前缀
  * @property workerThreadName worker 线程名前缀
  * @property sportIO 传输层实现，默认按平台自动选择最优
+ * @property sslContext TLS 上下文，非 null 时启用 HTTPS（isSecure/scheme 随之变化）
+ * @property compression 响应压缩配置，非 null 时启用 gzip/deflate 协商压缩
+ * @property docRoot 静态资源文档根目录（文件系统路径），非 null 时自动注册 DefaultServlet 映射 `/`，
+ * 并启用 getRealPath/getResourcePaths 的文件系统解析（优先于类路径）
+ * @property realm 认证域，非 null 时启用容器安全（BASIC/FORM 认证、角色约束、程序式登录）
+ * @property loginConfig 登录配置（认证方式/realm 名/FORM 页面），缺省 BASIC
+ * @property http2Enabled 启用 HTTP/2（明文 h2c 升级/prior-knowledge，TLS ALPN 协商）
+ * @property sessionStore 会话持久化存储，默认 [com.mingliqiye.web.netty.servlet.session.MemorySessionStore]（仅内存）；
+ * 磁盘用 DiskSessionStore，Redis 用 netty-server-session-redis 模块的 RedisSessionStore
  */
 data class ServletServerConfig(
 	val serverName: String? = null,
@@ -39,4 +48,12 @@ data class ServletServerConfig(
 	val bossThreadName: String = "NettyWebServerBoss",
 	val workerThreadName: String = "NettyWebServerWorker",
 	val sportIO: NettyIO = NettyIO.getSportIO(),
+	val sslContext: io.netty.handler.ssl.SslContext? = null,
+	val compression: com.mingliqiye.web.netty.server.config.CompressionConfig? = null,
+	val docRoot: String? = null,
+	val realm: com.mingliqiye.web.netty.servlet.security.Realm? = null,
+	val loginConfig: com.mingliqiye.web.netty.servlet.security.LoginConfig? = null,
+	val http2Enabled: Boolean = false,
+	val sessionStore: com.mingliqiye.web.netty.servlet.session.SessionStore =
+		com.mingliqiye.web.netty.servlet.session.MemorySessionStore,
 )

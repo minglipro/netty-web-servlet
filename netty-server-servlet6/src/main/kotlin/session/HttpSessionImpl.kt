@@ -52,6 +52,16 @@ class HttpSessionImpl(
 	/** 刷新最近访问时间。 */
 	fun touch() {
 		lastAccessed = System.currentTimeMillis()
+		manager?.persist(this)
+	}
+
+	/** 导出可序列化状态快照，供 [SessionStore] 持久化。 */
+	internal fun toStored(): StoredSession =
+		StoredSession(_id, created, lastAccessed, maxInactive, HashMap(attributes))
+
+	/** 恢复会话属性（静默装配，不触发绑定/属性监听器事件）。 */
+	internal fun restoreAttribute(name: String, value: Any) {
+		attributes[name] = value
 	}
 
 	/** 是否已超过不活动超时。 */
@@ -74,6 +84,7 @@ class HttpSessionImpl(
 
 	override fun setMaxInactiveInterval(interval: Int) {
 		maxInactive = interval
+		manager?.persist(this)
 	}
 
 	override fun getMaxInactiveInterval(): Int = maxInactive
@@ -101,6 +112,7 @@ class HttpSessionImpl(
 		} else {
 			bus?.sessionAttributeReplaced(this, name, old)
 		}
+		manager?.persist(this)
 	}
 
 	override fun removeAttribute(name: String) {
@@ -108,6 +120,7 @@ class HttpSessionImpl(
 		val old = attributes.remove(name) ?: return
 		bus?.sessionAttributeRemoved(this, name, old)
 		(old as? HttpSessionBindingListener)?.valueUnbound(HttpSessionBindingEvent(this, name, old))
+		manager?.persist(this)
 	}
 
 	/** 使会话失效：解绑全部属性、触发销毁事件并从管理器移除。 */

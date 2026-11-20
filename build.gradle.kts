@@ -33,6 +33,8 @@ subprojects {
 		"testImplementation"(kotlin("test"))
 		"testImplementation"("org.junit.jupiter:junit-jupiter:5.10.2")
 		"testImplementation"("org.apache.logging.log4j:log4j-slf4j2-impl:2.26.1")
+		"testImplementation"("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+		"testImplementation"("io.netty:netty-pkitesting:4.2.19.Final")
 		"testRuntimeOnly"("org.junit.platform:junit-platform-launcher")
 	}
 
@@ -121,6 +123,9 @@ subprojects {
 				from(components["java"])
 				artifact(tasks.named("javaDocJar"))
 				artifact(tasks.named("kotlinDocJar"))
+					tasks.findByName("fatjar")?.let {
+						artifact(it)
+				}
 				groupId = rootGroupId
 				group = project.group
 				pom {

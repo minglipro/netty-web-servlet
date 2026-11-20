@@ -58,18 +58,49 @@ internal class SessionCookieConfigImpl : SessionCookieConfig {
  * ServletContext 实现：应用属性（带监听器事件）、初始化参数、Servlet/Filter/监听器注册入口、
  * 会话 Cookie 与超时配置、请求/响应默认编码。
  *
- * 容器特定语义：会话超时以分钟为单位存取（内部按秒保存）；仅支持 COOKIE 会话跟踪；
- * 资源访问走类路径（无 Web 应用目录概念），JSP 不支持。
+ * 容器特定语义：会话超时以分钟为单位存取（内部按秒保存）；会话跟踪支持 COOKIE 与 URL（默认两者）；
+ * 资源访问优先 docRoot 文件系统、回退类路径；JSP 经 ServiceLoader 挂载引擎（引入 netty-server-jsp 时支持）。
  */
 internal class ServletContextImpl(private val container: ServletContainer) : ServletContext {
 	companion object {
 		private val log = Loggers.getLogger<ServletContextImpl>()
+
+		private val EXTRA_MIME = mapOf(
+			"js" to "text/javascript",
+			"mjs" to "text/javascript",
+			"css" to "text/css",
+			"json" to "application/json",
+			"svg" to "image/svg+xml",
+			"woff" to "font/woff",
+			"woff2" to "font/woff2",
+			"ttf" to "font/ttf",
+			"otf" to "font/otf",
+			"wasm" to "application/wasm",
+			"md" to "text/markdown",
+			"yaml" to "text/yaml",
+			"yml" to "text/yaml",
+		)
 	}
 
 	private val attributes = ConcurrentHashMap<String, Any>()
 	private val initParams = linkedMapOf<String, String>()
 	private val cookieConfig = SessionCookieConfigImpl()
 	internal val listeners = mutableListOf<EventListener>()
+
+	private var trackingModes: Set<SessionTrackingMode>? = null
+
+	/** contextInitialized 完成后置 true，此后禁止修改会话跟踪模式。 */
+	internal var initialized = false
+
+	private val docRoot: java.nio.file.Path? =
+		container.config.docRoot?.let { java.nio.file.Path.of(it).toAbsolutePath().normalize() }
+
+	/** 将上下文相对路径解析为 docRoot 内的安全路径，越界（..）返回 null。 */
+	private fun docFile(path: String): java.nio.file.Path? {
+		val root = docRoot ?: return null
+		val resolved = root.resolve(path.removePrefix("/")).normalize()
+		return if (resolved.startsWith(root)) resolved else null
+	}
 
 	override fun getContextPath(): String = container.config.contextPath
 
@@ -83,14 +114,61 @@ internal class ServletContextImpl(private val container: ServletContainer) : Ser
 
 	override fun getEffectiveMinorVersion(): Int = 1
 
-	override fun getMimeType(file: String): String? = URLConnection.guessContentTypeFromName(file)
+	override fun getMimeType(file: String): String? =
+		URLConnection.guessContentTypeFromName(file) ?: EXTRA_MIME[file.substringAfterLast('.', "").lowercase()]
 
-	override fun getResourcePaths(path: String): Set<String>? = null
+	override fun getResourcePaths(path: String): Set<String>? {
+		if (!path.startsWith("/") || !path.endsWith("/")) return null
+		val result = sortedSetOf<String>()
+		docFile(path)?.takeIf { java.nio.file.Files.isDirectory(it) }?.let { dir ->
+			java.nio.file.Files.list(dir).use { entries ->
+				entries.forEach { p ->
+					val name = dir.relativize(p).toString().replace('\\', '/')
+					result.add(path + name + if (java.nio.file.Files.isDirectory(p)) "/" else "")
+				}
+			}
+		}
+		val dirName = path.removePrefix("/").removeSuffix("/")
+		if (dirName.isNotEmpty()) {
+			val urls = classLoader.getResources(dirName)
+			while (urls.hasMoreElements()) {
+				val url = urls.nextElement()
+				when (url.protocol) {
+					"file" -> {
+						val dir = java.nio.file.Path.of(url.toURI())
+						java.nio.file.Files.list(dir).use { entries ->
+							entries.forEach { p ->
+								val name = p.fileName.toString()
+								result.add(path + name + if (java.nio.file.Files.isDirectory(p)) "/" else "")
+							}
+						}
+					}
+					"jar" -> {
+						val jar = (url.openConnection() as java.net.JarURLConnection).jarFile
+						val prefix = "$dirName/"
+						jar.entries().asSequence().forEach { entry ->
+							if (entry.name.startsWith(prefix) && entry.name != prefix) {
+								val rest = entry.name.removePrefix(prefix)
+								val top = rest.substringBefore('/')
+								result.add(path + top + if (rest.contains('/') || entry.isDirectory) "/" else "")
+							}
+						}
+					}
+				}
+			}
+		}
+		return result.ifEmpty { null }
+	}
 
-	override fun getResource(path: String): URL? = classLoader.getResource(path.removePrefix("/"))
+	override fun getResource(path: String): URL? {
+		docFile(path)?.takeIf { java.nio.file.Files.exists(it) }?.let { return it.toUri().toURL() }
+		return classLoader.getResource(path.removePrefix("/"))
+	}
 
-	override fun getResourceAsStream(path: String): InputStream? =
-		classLoader.getResourceAsStream(path.removePrefix("/"))
+	override fun getResourceAsStream(path: String): InputStream? {
+		docFile(path)?.takeIf { java.nio.file.Files.isRegularFile(it) }?.let { return java.nio.file.Files.newInputStream(it) }
+		return classLoader.getResourceAsStream(path.removePrefix("/"))
+	}
 
 	override fun getRequestDispatcher(path: String): RequestDispatcher? {
 		if (!path.startsWith("/")) return null
@@ -102,7 +180,7 @@ internal class ServletContextImpl(private val container: ServletContainer) : Ser
 		return NamedRequestDispatcher(registration.servlet)
 	}
 
-	override fun getRealPath(path: String): String? = null
+	override fun getRealPath(path: String): String? = docFile(path)?.toString()
 
 	override fun getServerInfo(): String = "NettyServlet/1.0"
 
@@ -182,14 +260,18 @@ internal class ServletContextImpl(private val container: ServletContainer) : Ser
 	override fun getSessionCookieConfig(): SessionCookieConfig = cookieConfig
 
 	override fun setSessionTrackingModes(sessionTrackingModes: Set<SessionTrackingMode>) {
-		require(sessionTrackingModes.all { it == SessionTrackingMode.COOKIE }) {
-			"Only COOKIE session tracking is supported"
+		check(!initialized) { "Session tracking modes cannot be changed after context initialization" }
+		if (SessionTrackingMode.SSL in sessionTrackingModes) {
+			require(sessionTrackingModes.size == 1) { "SSL session tracking must be used alone" }
 		}
+		trackingModes = sessionTrackingModes.toSet()
 	}
 
-	override fun getDefaultSessionTrackingModes(): Set<SessionTrackingMode> = setOf(SessionTrackingMode.COOKIE)
+	override fun getDefaultSessionTrackingModes(): Set<SessionTrackingMode> =
+		setOf(SessionTrackingMode.COOKIE, SessionTrackingMode.URL)
 
-	override fun getEffectiveSessionTrackingModes(): Set<SessionTrackingMode> = setOf(SessionTrackingMode.COOKIE)
+	override fun getEffectiveSessionTrackingModes(): Set<SessionTrackingMode> =
+		trackingModes ?: defaultSessionTrackingModes
 
 	override fun addListener(listenerClass: Class<out EventListener>) {
 		listeners.add(createListener(listenerClass))
@@ -211,7 +293,9 @@ internal class ServletContextImpl(private val container: ServletContainer) : Ser
 
 	override fun getClassLoader(): ClassLoader = javaClass.classLoader
 
-	override fun declareRoles(vararg roleNames: String) {}
+	override fun declareRoles(vararg roleNames: String) {
+		container.declaredRoles.addAll(roleNames)
+	}
 
 	override fun getVirtualServerName(): String = "localhost"
 
@@ -238,8 +322,14 @@ internal class ServletContextImpl(private val container: ServletContainer) : Ser
 
 	override fun getJspConfigDescriptor(): JspConfigDescriptor? = null
 
-	override fun addJspFile(servletName: String, jspFile: String): ServletRegistration.Dynamic =
-		throw UnsupportedOperationException("JSP not supported")
+	override fun addJspFile(servletName: String, jspFile: String): ServletRegistration.Dynamic {
+		val engine = container.jspEngine
+			?: throw UnsupportedOperationException("JSP not supported: add the netty-server-jsp module")
+		container.ensureJspEngine()
+		val registration = container.addServlet(servletName, engine.createServlet(), jspFile)
+		registration.setInitParameter("jspFile", jspFile)
+		return registration
+	}
 
 	override fun log(msg: String) {
 		log.info(msg)

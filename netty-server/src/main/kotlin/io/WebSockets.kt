@@ -49,6 +49,7 @@ object WebSockets {
 	 * @param subprotocol 协商出的子协议，null 表示不响应 Sec-WebSocket-Protocol
 	 * @param maxFramePayloadLength 单帧负载上限（字节）
 	 * @param frameHandler 接管 WebSocket 帧的业务处理器
+	 * @param extensions 已协商的服务端扩展（如 permessage-deflate），按序插入编解码器并允许 RSV 位
 	 */
 	fun upgrade(
 		ctx: ChannelHandlerContext,
@@ -56,6 +57,7 @@ object WebSockets {
 		subprotocol: String?,
 		maxFramePayloadLength: Int,
 		frameHandler: ChannelHandler,
+		extensions: List<io.netty.handler.codec.http.websocketx.extensions.WebSocketServerExtension> = emptyList(),
 	) {
 		val key = request.headers().get(HttpHeaderNames.SEC_WEBSOCKET_KEY)
 			?: throw IllegalArgumentException("Missing Sec-WebSocket-Key")
@@ -68,13 +70,37 @@ object WebSockets {
 			if (subprotocol != null) {
 				response.headers().set(HttpHeaderNames.SEC_WEBSOCKET_PROTOCOL, subprotocol)
 			}
+			if (extensions.isNotEmpty()) {
+				response.headers().set(HttpHeaderNames.SEC_WEBSOCKET_EXTENSIONS, extensionsHeaderValue(extensions))
+			}
 			ctx.writeAndFlush(response)
 			val pipeline = ctx.pipeline()
-			listOf(HttpServerCodec::class.java, HttpObjectAggregator::class.java, WebHandler::class.java, StreamingWebHandler::class.java)
-				.forEach { if (pipeline.get(it) != null) pipeline.remove(it) }
-			pipeline.addLast(WebSocket13FrameDecoder(true, false, maxFramePayloadLength, false))
+			listOf(
+				HttpServerCodec::class.java, HttpObjectAggregator::class.java,
+				WebHandler::class.java, StreamingWebHandler::class.java,
+				io.netty.handler.codec.http.HttpContentCompressor::class.java,
+			).forEach { if (pipeline.get(it) != null) pipeline.remove(it) }
+			pipeline.addLast(WebSocket13FrameDecoder(true, extensions.isNotEmpty(), maxFramePayloadLength, false))
+			extensions.forEach { pipeline.addLast(it.newExtensionDecoder()) }
+			extensions.forEach { pipeline.addLast(it.newExtensionEncoder()) }
 			pipeline.addLast(WebSocket13FrameEncoder(false))
 			pipeline.addLast(frameHandler)
+		}
+	}
+
+	/** 按 RFC 6455 扩展头格式拼接协商结果（name; param=value; flag）。 */
+	private fun extensionsHeaderValue(
+		extensions: List<io.netty.handler.codec.http.websocketx.extensions.WebSocketServerExtension>,
+	): String = extensions.joinToString(", ") { ext ->
+		val data = ext.newReponseData()
+		buildString {
+			append(data.name())
+			for ((name, value) in data.parameters()) {
+				append("; ").append(name)
+				if (!value.isNullOrEmpty()) {
+					append('=').append(value)
+				}
+			}
 		}
 	}
 }

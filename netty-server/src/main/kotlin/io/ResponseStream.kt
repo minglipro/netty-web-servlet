@@ -1,5 +1,6 @@
 package com.mingliqiye.web.netty.server.io
 
+import com.mingliqiye.web.netty.server.io.HeaderUtils.addSystemHeaders
 import io.netty.buffer.ByteBuf
 import io.netty.channel.ChannelFutureListener
 import io.netty.channel.ChannelHandlerContext
@@ -22,6 +23,7 @@ class ResponseStream(
 	/** 发送响应头，开始 chunked 输出；连接不可用时静默丢弃。 */
 	fun start(response: HttpResponse) {
 		HttpUtil.setKeepAlive(response, keepAlive)
+		response.addSystemHeaders()
 		ctx.executor().execute {
 			if (ctx.channel().isActive) {
 				ctx.writeAndFlush(response)

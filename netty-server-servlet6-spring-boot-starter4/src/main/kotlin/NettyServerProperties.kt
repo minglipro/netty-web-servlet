@@ -18,6 +18,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties
  * @property bossThreadName boss 线程名前缀
  * @property workerThreadName worker 线程名前缀
  * @property transport 传输层实现（IO_URING/EPOLL/KQUEUE/NIO），null 时按平台自动选择
+ * @property sessionStorePath 会话磁盘持久化文件路径，非 null 时启用 DiskSessionStore（停机落盘、启动恢复）；
+ * null 时会话仅存内存。需 Redis 共享会话时自定义 SessionStore Bean 覆盖
  */
 @ConfigurationProperties(prefix = "server.netty")
 data class NettyServerProperties(
@@ -32,4 +34,6 @@ data class NettyServerProperties(
 	var bossThreadName: String = "NettyWebServerBoss",
 	var workerThreadName: String = "NettyWebServerWorker",
 	var transport: NettyIO? = null,
+	var sessionStorePath: String? = null,
+	var serverName: String? = null,
 )

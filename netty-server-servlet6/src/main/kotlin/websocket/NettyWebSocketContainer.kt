@@ -5,7 +5,29 @@ import com.mingliqiye.web.netty.server.io.WebSockets
 import com.mingliqiye.web.netty.servlet.core.ServletContainer
 import com.mingliqiye.web.netty.servlet.http.HttpServletRequestImpl
 import com.mingliqiye.web.netty.servlet.http.HttpServletResponseImpl
+import io.netty.bootstrap.Bootstrap
+import io.netty.channel.ChannelHandlerContext
+import io.netty.channel.ChannelInitializer
+import io.netty.channel.MultiThreadIoEventLoopGroup
+import io.netty.channel.SimpleChannelInboundHandler
+import io.netty.channel.nio.NioIoHandler
+import io.netty.channel.socket.SocketChannel
+import io.netty.channel.socket.nio.NioSocketChannel
+import io.netty.handler.codec.http.DefaultHttpHeaders
+import io.netty.handler.codec.http.FullHttpResponse
+import io.netty.handler.codec.http.HttpClientCodec
+import io.netty.handler.codec.http.HttpObjectAggregator
 import io.netty.handler.codec.http.QueryStringDecoder
+import io.netty.handler.codec.http.websocketx.WebSocket13FrameEncoder
+import io.netty.handler.codec.http.websocketx.WebSocketClientHandshaker13
+import io.netty.handler.codec.http.websocketx.WebSocketVersion
+import io.netty.handler.ssl.ApplicationProtocolConfig
+import io.netty.handler.ssl.ClientAuth
+import io.netty.handler.ssl.IdentityCipherSuiteFilter
+import io.netty.handler.ssl.JdkSslContext
+import io.netty.handler.ssl.SslContextBuilder
+import jakarta.websocket.ClientEndpoint
+import jakarta.websocket.ClientEndpointConfig
 import jakarta.websocket.CloseReason
 import jakarta.websocket.DeploymentException
 import jakarta.websocket.Endpoint
@@ -19,7 +41,9 @@ import jakarta.websocket.server.ServerEndpointConfig
 import java.io.IOException
 import java.net.URI
 import java.security.Principal
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -31,7 +55,8 @@ import java.util.concurrent.TimeUnit
  * - Spring 等框架经 ServletContext 属性取得本容器后调用 [upgradeHttpToWebSocket]。
  *
  * 空闲会话由后台检查器按 [Session.getMaxIdleTimeout] 关闭；容器停机时 [closeAll] 以 GOING_AWAY 关闭全部会话。
- * 仅支持服务端，connectToServer 抛 [UnsupportedOperationException]。
+ * 同时支持客户端：connectToServer 四形态（注解实例/类、[Endpoint] 实例/类 + [ClientEndpointConfig]），
+ * 客户端帧强制掩码，wss 走 [ClientEndpointConfig.getSSLContext] 或默认信任库。
  */
 class NettyWebSocketContainer internal constructor(private val container: ServletContainer) : ServerContainer {
 	companion object {
@@ -60,6 +85,13 @@ class NettyWebSocketContainer internal constructor(private val container: Servle
 	}.also {
 		it.scheduleAtFixedRate(::checkIdleSessions, 1, 1, TimeUnit.SECONDS)
 	}
+
+	private val clientGroupLazy = lazy {
+		MultiThreadIoEventLoopGroup(1, java.util.concurrent.ThreadFactory { r ->
+			Thread(r, "websocket-client").apply { isDaemon = true }
+		}, NioIoHandler.newFactory())
+	}
+	private val clientGroup: MultiThreadIoEventLoopGroup by clientGroupLazy
 
 	private fun checkIdleSessions() {
 		val now = System.currentTimeMillis()
@@ -98,19 +130,135 @@ class NettyWebSocketContainer internal constructor(private val container: Servle
 		maxTextBufferSize = length
 	}
 
-	override fun getInstalledExtensions(): Set<Extension> = emptySet()
+	override fun getInstalledExtensions(): Set<Extension> =
+		setOf(WebSocketExtensionImpl("permessage-deflate", emptyList()))
 
 	override fun connectToServer(annotatedEndpoint: Any, path: URI): Session =
-		throw UnsupportedOperationException("Client WebSocket connections are not supported")
+		doConnect(AnnotatedEndpointAdapter(annotatedEndpoint), clientConfigFor(annotatedEndpoint.javaClass), path)
 
-	override fun connectToServer(annotatedEndpointClass: Class<*>, path: URI): Session =
-		throw UnsupportedOperationException("Client WebSocket connections are not supported")
+	override fun connectToServer(annotatedEndpointClass: Class<*>, path: URI): Session {
+		val instance = annotatedEndpointClass.getDeclaredConstructor().newInstance()
+		return doConnect(AnnotatedEndpointAdapter(instance), clientConfigFor(annotatedEndpointClass), path)
+	}
 
-	override fun connectToServer(endpoint: Endpoint, config: jakarta.websocket.ClientEndpointConfig, path: URI): Session =
-		throw UnsupportedOperationException("Client WebSocket connections are not supported")
+	override fun connectToServer(endpoint: Endpoint, config: ClientEndpointConfig, path: URI): Session =
+		doConnect(endpoint, config, path)
 
-	override fun connectToServer(endpointClass: Class<out Endpoint>, config: jakarta.websocket.ClientEndpointConfig, path: URI): Session =
-		throw UnsupportedOperationException("Client WebSocket connections are not supported")
+	override fun connectToServer(endpointClass: Class<out Endpoint>, config: ClientEndpointConfig, path: URI): Session =
+		doConnect(endpointClass.getDeclaredConstructor().newInstance(), config, path)
+
+	/** 从 @ClientEndpoint 注解读取子协议/编解码器/Configurator；无注解时用默认配置。 */
+	private fun clientConfigFor(clazz: Class<*>): ClientEndpointConfig {
+		val annotation = clazz.getAnnotation(ClientEndpoint::class.java)
+			?: return ClientEndpointConfig.Builder.create().build()
+		return ClientEndpointConfig.Builder.create()
+			.preferredSubprotocols(annotation.subprotocols.toList())
+			.encoders(annotation.encoders.map { it.java })
+			.decoders(annotation.decoders.map { it.java })
+			.configurator(annotation.configurator.java.getDeclaredConstructor().newInstance())
+			.build()
+	}
+
+	/**
+	 * 客户端连接：TCP（wss 加 TLS）→ HTTP 101 升级握手 → 帧管线。
+	 * [WebSocketClientHandshaker13.finishHandshake] 负责校验响应并就地替换 HTTP 解码器为帧解码器；
+	 * 握手完成后登记会话、回调 Configurator.afterResponse 与 endpoint.onOpen，再向调用方返回。
+	 */
+	private fun doConnect(endpoint: Endpoint, config: ClientEndpointConfig, path: URI): Session {
+		val scheme = path.scheme?.lowercase()
+		if (scheme != "ws" && scheme != "wss") {
+			throw DeploymentException("Unsupported WebSocket URI scheme: ${path.scheme}")
+		}
+		val host = path.host ?: throw DeploymentException("WebSocket URI has no host: $path")
+		val port = if (path.port != -1) path.port else if (scheme == "wss") 443 else 80
+
+		val headerMap = mutableMapOf<String, List<String>>()
+		config.configurator.beforeRequest(headerMap)
+		val headers = DefaultHttpHeaders()
+		headerMap.forEach { (name, values) -> headers.add(name, values) }
+
+		val handshaker = WebSocketClientHandshaker13(
+			path, WebSocketVersion.V13,
+			config.preferredSubprotocols.joinToString(",").ifEmpty { null },
+			false, headers, MAX_FRAME_PAYLOAD_LENGTH,
+		)
+		val ready = CompletableFuture<Session>()
+		val bootstrap = Bootstrap()
+			.group(clientGroup)
+			.channel(NioSocketChannel::class.java)
+			.handler(object : ChannelInitializer<SocketChannel>() {
+				override fun initChannel(ch: SocketChannel) {
+					val pipeline = ch.pipeline()
+					if (scheme == "wss") {
+						val sslContext = config.getSSLContext()?.let {
+							JdkSslContext(it, true, null, IdentityCipherSuiteFilter.INSTANCE, ApplicationProtocolConfig.DISABLED, ClientAuth.NONE, null, false)
+						} ?: SslContextBuilder.forClient().build()
+						pipeline.addLast(sslContext.newHandler(ch.alloc(), host, port))
+					}
+					pipeline.addLast(HttpClientCodec())
+					pipeline.addLast(HttpObjectAggregator(MAX_FRAME_PAYLOAD_LENGTH))
+					pipeline.addLast(object : SimpleChannelInboundHandler<FullHttpResponse>() {
+						private var session: WebSocketSessionImpl? = null
+
+						override fun channelRead0(ctx: ChannelHandlerContext, response: FullHttpResponse) {
+							try {
+								handshaker.finishHandshake(ch, response)
+							} catch (e: Exception) {
+								ready.completeExceptionally(e)
+								ch.close()
+								return
+							}
+							config.configurator.afterResponse(object : HandshakeResponse {
+								override fun getHeaders(): MutableMap<String, MutableList<String>> {
+									val map = linkedMapOf<String, MutableList<String>>()
+									for (entry in response.headers().entries()) {
+										map.getOrPut(entry.key) { mutableListOf() }.add(entry.value)
+									}
+									return map
+								}
+							})
+							val newSession = WebSocketSessionImpl(
+								this@NettyWebSocketContainer, ClientWebSocketTransport(ch, path), config,
+								endpoint, emptyMap(), handshaker.actualSubprotocol() ?: "",
+							)
+							session = newSession
+							openSessions.add(newSession)
+							ctx.pipeline().remove(this)
+							ctx.pipeline().addLast(WebSocket13FrameEncoder(true))
+							ctx.pipeline().addLast(WebSocketFrameHandler(newSession))
+							try {
+								endpoint.onOpen(newSession, config)
+							} catch (e: Exception) {
+								log.error("WebSocket client onOpen failed for session ${newSession.id}", e)
+								newSession.fireError(e)
+								newSession.close(CloseReason(CloseReason.CloseCodes.UNEXPECTED_CONDITION, "onOpen failed"))
+							}
+							ready.complete(newSession)
+						}
+
+						override fun channelInactive(ctx: ChannelHandlerContext) {
+							ready.completeExceptionally(IOException("Connection closed before WebSocket handshake completed"))
+							super.channelInactive(ctx)
+						}
+
+						override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+							if (!ready.completeExceptionally(cause)) {
+								session?.fireError(cause)
+							}
+							ctx.close()
+						}
+					})
+				}
+			})
+		try {
+			val channel = bootstrap.connect(host, port).sync().channel()
+			handshaker.handshake(channel).sync()
+			return ready.get(10, TimeUnit.SECONDS)
+		} catch (e: Exception) {
+			val cause = if (e is ExecutionException) e.cause ?: e else e
+			throw DeploymentException("WebSocket connect to $path failed: ${cause.message}", cause)
+		}
+	}
 
 	// ---- 端点注册 ----
 
@@ -173,6 +321,15 @@ class NettyWebSocketContainer internal constructor(private val container: Servle
 
 	// ---- 升级握手 ----
 
+	/** 解析客户端扩展提议并逐个协商（当前支持 permessage-deflate），每次握手独立实例。 */
+	private fun negotiateExtensions(header: String?): List<io.netty.handler.codec.http.websocketx.extensions.WebSocketServerExtension> {
+		if (header.isNullOrBlank()) return emptyList()
+		// 0 = 默认窗口上限，等价于已弃用的无参构造
+		val handshaker = io.netty.handler.codec.http.websocketx.extensions.compression.PerMessageDeflateServerExtensionHandshaker(0)
+		return io.netty.handler.codec.http.websocketx.extensions.WebSocketExtensionUtil.extractExtensions(header)
+			.mapNotNull { handshaker.handshakeExtension(it) }
+	}
+
 	override fun upgradeHttpToWebSocket(
 		request: Any,
 		response: Any,
@@ -204,13 +361,14 @@ class NettyWebSocketContainer internal constructor(private val container: Servle
 		val requested = req.getHeader("Sec-WebSocket-Protocol")
 			?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
 		val subprotocol = configurator.getNegotiatedSubprotocol(config.subprotocols, requested) ?: ""
+		val extensions = negotiateExtensions(req.getHeader("Sec-WebSocket-Extensions"))
 		val instance = configurator.getEndpointInstance(config.endpointClass)
 		val endpoint = instance as? Endpoint ?: AnnotatedEndpointAdapter(instance)
-		val session = WebSocketSessionImpl(this, req, config, endpoint, pathParams, subprotocol)
+		val session = WebSocketSessionImpl(this, ServletWebSocketTransport(req), config, endpoint, pathParams, subprotocol, extensions)
 		req._upgraded = true
 		resp.markCommitted()
-		log.debug { "Upgrading ${req.requestURI} to WebSocket, endpoint=${config.endpointClass.name} subprotocol='$subprotocol'" }
-		WebSockets.upgrade(req.ctx, req.nettyRequest, subprotocol.ifEmpty { null }, MAX_FRAME_PAYLOAD_LENGTH, WebSocketFrameHandler(session))
+		log.debug { "Upgrading ${req.requestURI} to WebSocket, endpoint=${config.endpointClass.name} subprotocol='$subprotocol' extensions=${extensions.map { it.newReponseData().name() }}" }
+		WebSockets.upgrade(req.ctx, req.nettyRequest, subprotocol.ifEmpty { null }, MAX_FRAME_PAYLOAD_LENGTH, WebSocketFrameHandler(session), extensions)
 		req.ctx.executor().execute {
 			openSessions.add(session)
 			try {
@@ -223,11 +381,14 @@ class NettyWebSocketContainer internal constructor(private val container: Servle
 		}
 	}
 
-	/** 容器停机：关闭全部会话（GOING_AWAY）并停止空闲检查器。 */
+	/** 容器停机：关闭全部会话（GOING_AWAY）、停止空闲检查器与客户端事件循环。 */
 	internal fun closeAll() {
 		idleChecker.shutdownNow()
 		val reason = CloseReason(CloseReason.CloseCodes.GOING_AWAY, "Server shutdown")
 		openSessions.toList().forEach { runCatching { it.close(reason) } }
+		if (clientGroupLazy.isInitialized()) {
+			clientGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS)
+		}
 	}
 }
 
